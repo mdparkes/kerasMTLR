@@ -1,5 +1,5 @@
 # kerasMTLR
-An implementation of the MTLR algorithm for survival prediction using TensorFlow with Keras. Based on the paper ["Distributions as a Sequence of Dependent Regressors"](http://www.cs.cornell.edu/~cnyu/papers/nips11_survival.pdf) by Yu *et al* (NIPS 2011), but does not use the second parameter smoothing regularizer, as it has been shown that this regularizer is unnecessary.
+An implementation of the MTLR algorithm for survival prediction using TensorFlow with Keras. Based on the paper ["Learning Patient-Specific Cancer Survival Distributions as a Sequence of Dependent Regressors"](http://www.cs.cornell.edu/~cnyu/papers/nips11_survival.pdf) by Yu *et al* (NIPS 2011), but does not use the second parameter smoothing regularizer, as it has been shown that this regularizer is unnecessary.
 
 ## Details
 The `NeuralNetworkMTLRSurvival` class extends `keras.Model` and allows the user to model individualized survival distributions from a latent representation of observed input features using MTLR. See below for a more detailed description of the MTLR algorithm. This model works with right-censored data, but does not support left- or interval-censored data. Its forward pass outputs a cumulative distribution of probabilities that a patient will survive at least until the beginning of each of a series of time intervals modeled by MTLR.
