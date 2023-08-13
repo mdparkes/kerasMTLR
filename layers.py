@@ -212,7 +212,7 @@ class MTLR(tf.keras.layers.Layer):
         uc_seq = tf.map_fn(lambda t: tf.where(t < self.interval_upper,
                                               tf.ones_like(self.interval_upper),
                                               tf.zeros_like(self.interval_upper)), uc_time)
-        lc_seq = tf.map_fn(lambda t: tf.where(t >= self.interval_upper,
+        lc_seq = tf.map_fn(lambda t: tf.where(t >= self.interval_lower,
                                               tf.ones_like(self.interval_upper),
                                               tf.zeros_like(self.interval_upper)), lc_time)
         sequence = tf.dynamic_stitch(condition_indices, data=[rc_seq, uc_seq, lc_seq])
