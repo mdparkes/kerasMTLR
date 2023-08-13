@@ -128,12 +128,12 @@ class NeuralNetworkMTLRSurvival(tf.keras.Model):
         uncensored at the indicated time. Left-censored events should be indicated by -1, uncensored by 1,
         and right-censored by 0."""
 
-        time = tf.reshape(time, (-1,))  # Reshape as rank 1 tensor, i.e., vector
+        time = tf.cast(tf.reshape(time, (-1,)), tf.float32)  # Reshape as rank 1 tensor, i.e., vector
         # Cast event as int32 so it can be used with tf.dynamic_partition. A value of -1 indicates left censored
         # data, 0 indicates right-censored data, and 1 indicates uncensored data.
         # Dynamic partitioning can only use non-negative integers, so left-censoring values of -1 are substituted with 2
-        event = tf.where(event == -1, tf.fill(tf.shape(event), 2), event)
         event = tf.cast(tf.reshape(event, (-1,)), tf.int32)
+        event = tf.where(event == -1, tf.fill(tf.shape(event), 2), event)
         n_obs = tf.shape(features)[0]
 
         def true_fn():  # For tf.case() below, executed if a condition is satisfied
