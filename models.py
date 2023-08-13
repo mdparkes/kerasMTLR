@@ -125,10 +125,15 @@ class NeuralNetworkMTLRSurvival(tf.keras.Model):
         be autodifferentiated, but autodifferentation is used to learn the trainable parameters of the ANN block that
         gives the input to the MTLR layer (unless the block specifies its own custom gradients). Different gradients
         and losses are calculated for an input to the MTLR layer depending on whether the observation was censored or
-        uncensored at the indicated time."""
-        time = tf.reshape(time, (-1, ))  # Reshape as rank 1 tensor, i.e., vector
-        # Cast event as int32 so it can be used with tf.dynamic_partition
-        event = tf.cast(tf.reshape(event, (-1, )), tf.int32)  # 1 indicates an uncensored outcome, 0 indicates censoring
+        uncensored at the indicated time. Left-censored events should be indicated by -1, uncensored by 1,
+        and right-censored by 0."""
+
+        time = tf.reshape(time, (-1,))  # Reshape as rank 1 tensor, i.e., vector
+        # Cast event as int32 so it can be used with tf.dynamic_partition. A value of -1 indicates left censored
+        # data, 0 indicates right-censored data, and 1 indicates uncensored data.
+        # Dynamic partitioning can only use non-negative integers, so left-censoring values of -1 are substituted with 2
+        event = tf.where(event == -1, tf.fill(tf.shape(event), 2), event)
+        event = tf.cast(tf.reshape(event, (-1,)), tf.int32)
         n_obs = tf.shape(features)[0]
 
         def true_fn():  # For tf.case() below, executed if a condition is satisfied
@@ -136,8 +141,8 @@ class NeuralNetworkMTLRSurvival(tf.keras.Model):
 
         # If the MTLR input is rank 1 (a vector), reshape it to a rank 2 row vector (a matrix with one row)
         features = tf.case([(tf.equal(tf.rank(features), 1), true_fn)], default=lambda: features)
-        surv_seq = self.mtlr.surv_seq(time)  # Binary survival sequences of training examples in the batch
-        cns_seq, uncns_seq = tf.dynamic_partition(surv_seq, event, 2)
+        surv_seq = self.mtlr.surv_seq(time, event)  # Binary survival sequences of training examples in the batch
+        rc_seq, uc_seq, lc_seq = tf.dynamic_partition(surv_seq, event, 3)
 
         # Below several objects are created to calculate the losses and gradients.
         # linear_scores is a (n_obs x m) matrix of real-valued, untransformed scores for observing a 1 at each of m
@@ -151,12 +156,14 @@ class NeuralNetworkMTLRSurvival(tf.keras.Model):
         # log_normalization is the normaliztion factor that transforms unnormalized cum_scores into probabilities
         # uncns_log_score is the unnormalized score associated with observing the survival sequence for the observed
         #   event time.
-        # cns_log_score is the unnormalized sum of scores associated with each survival sequence that is possible
-        #   given the censoring time.
+        # lc_log_score is the unnormalized sum of scores associated with each survival sequence that is possible
+        #   given the left censoring time.
+        # rc_log_score is the unnormalized sum of scores associated with each survival sequence that is possible
+        #   given the right censoring time.
         # shift is a factor that is used to make exponentiation numerically stable.
         # self.mtlr.ltri is an (m x m+1) augmented lower triangular binary matrix whose columns represent each possible
         #   survival sequence that can be modeled by MTLR. It is used for various linear algebra operations in the
-        #   loss and gradient calculations.
+        #   loss and gradient calculations. Its final column is a zero vector.
 
         # Calculate batch-wide scores and normalization factors
         linear_scores = tf.matmul(features, self.mtlr.w) + self.mtlr.b  # (n_obs x m)
@@ -165,33 +172,43 @@ class NeuralNetworkMTLRSurvival(tf.keras.Model):
         cum_scores = tf.exp(cum_scores - shift)  # vector function f(x, a) -> (n_obs x m+1)
         log_normalization = tf.math.log(tf.reduce_sum(cum_scores, axis=1, keepdims=True)) + shift  # (n_obs x 1)
 
-        # Partition the set of input example tensors into two partitions according to censor status
-        condition_indices = tf.dynamic_partition(tf.range(tf.shape(features)[0]), event, 2)  # For restitching
-        cns_input, uncns_input = tf.dynamic_partition(features, event, 2)  # Returns a list of partition tensors
-        cns_cum_scores, uncns_cum_scores = tf.dynamic_partition(cum_scores, event, 2)  # (n_cns|n_uncns x 1)
-        cns_shift, uncns_shift = tf.dynamic_partition(shift, event, 2)  # (n_cns|n_uncns x 1)
-        cns_log_norm, uncns_log_norm = tf.dynamic_partition(log_normalization, event, 2)  # (n_cns|n_uncns x 1)
+        # Partition the set of input example tensors into three partitions according to censor status
+        obs_idx = tf.range(tf.shape(features)[0])  # Indices of each example in the data set
+        condition_indices = tf.dynamic_partition(obs_idx, event, 3)  # For restitching
+        # lc: left censored (event = -1); rc: right censored (event = 0); uc: uncensored (event = 1)
+        rc_input, uc_input, lc_input = tf.dynamic_partition(features, event, 3)  # List of partitions
+        rc_cum_scores, uc_cum_scores, lc_cum_scores = tf.dynamic_partition(cum_scores, event, 3)  # (n_cns|n_uncns x 1)
+        rc_shift, uc_shift, lc_shift = tf.dynamic_partition(shift, event, 3)  # (n_cns|n_uncns x 1)
+        rc_log_norm, uc_log_norm, lc_log_norm = tf.dynamic_partition(log_normalization, event, 3)  # (n_cns|n_uncns x 1)
 
-        # Calculate censored losses for each example in the batch
-        cns_log_score = tf.math.log(tf.reduce_sum(tf.multiply(cns_cum_scores, cns_seq), axis=1, keepdims=True))
+        # Calculate left-censored losses for each example in the batch
+        lc_log_score = tf.math.log(tf.reduce_sum(tf.multiply(lc_cum_scores, lc_seq), axis=1, keepdims=True))
         # The censored log score is the log of an exponentiated sum of terms. To make the exponentiation numerically
         # stable, we shifted each term by subtracting a value. The shift is negated by adding the value back to
-        # cns_log_score below.
-        cns_log_score = cns_log_score + cns_shift
-        cns_loss = -1 * (cns_log_score - cns_log_norm)  # (n_cns x 1), neg. log. likelihood
+        # lc_log_score below.
+        lc_log_score = lc_log_score + lc_shift
+        lc_loss = -1 * (lc_log_score - lc_log_norm)  # (n_cns x 1), neg. log. likelihood
 
-        # Calculate uncensored losses each example in the batch
-        _, uncns_scores = tf.dynamic_partition(linear_scores, event, 2)
+        # Calculate right-censored losses for each example in the batch
+        rc_log_score = tf.math.log(tf.reduce_sum(tf.multiply(rc_cum_scores, rc_seq), axis=1, keepdims=True))
+        # The censored log score is the log of an exponentiated sum of terms. To make the exponentiation numerically
+        # stable, we shifted each term by subtracting a value. The shift is negated by adding the value back to
+        # rc_log_score below.
+        rc_log_score = rc_log_score + rc_shift
+        rc_loss = -1 * (rc_log_score - rc_log_norm)  # (n_cns x 1), neg. log. likelihood
+
+        # Calculate uncensored losses for each example in the batch
+        _, uncns_scores, _ = tf.dynamic_partition(linear_scores, event, 3)
         n_uncns = tf.shape(uncns_scores)[0]
         uncns_scores = tf.concat([uncns_scores, tf.zeros(shape=(n_uncns, 1), dtype=tf.float32)], axis=1)
         # The "real" uncensored log score is the log of a single exponentiated term, but taking the log nullifies
         # the exponentiation, so we omit both operations below in an equivalent expression. This removes the need to
         # adjust the log score by the shift, since shift is only used to guarantee numeric stability when the
         # exponentiation is actually calculated, as it was for the censored score.
-        uncns_log_score = tf.reduce_sum(tf.multiply(uncns_scores, uncns_seq), axis=1, keepdims=True)
-        uncns_loss = -1 * (uncns_log_score - uncns_log_norm)  # (n_uncns x 1), neg. log. likelihood
+        uncns_log_score = tf.reduce_sum(tf.multiply(uncns_scores, uc_seq), axis=1, keepdims=True)
+        uncns_loss = -1 * (uncns_log_score - uc_log_norm)  # (n_uncns x 1), neg. log. likelihood
 
-        mtlr_loss_result = tf.dynamic_stitch(condition_indices, [cns_loss, uncns_loss])  # (n_obs x 1)
+        mtlr_loss_result = tf.dynamic_stitch(condition_indices, [rc_loss, uncns_loss, lc_loss])  # (n_obs x 1)
         mtlr_loss_result = tf.reduce_mean(mtlr_loss_result)  # Mean negative log likelihood for the batch
 
         def gradient(grad, variables):
@@ -209,39 +226,59 @@ class NeuralNetworkMTLRSurvival(tf.keras.Model):
 
             variables_grad = []
 
-            # region Censored partial gradients
-            valid_scores = tf.multiply(cns_cum_scores, cns_seq)
-            # Since cns_cum_scores was calculated using the shift, we need to use a log_norm term that is calculated
+            # region Left-censored partial gradients
+            valid_scores = tf.multiply(lc_cum_scores, lc_seq)
+            # Since lc_cum_scores was calculated using the shift, we need to use a log_norm term that is calculated
             # from shifted scores to get norm1. This is achieved by taking the unshifted log_norm and subtracting the
             # shift value.
-            norm1 = tf.exp(cns_log_norm - cns_shift)  # Normalization of all survival sequences
+            norm1 = tf.exp(lc_log_norm - lc_shift)  # Normalization of all survival sequences
             norm2 = tf.reduce_sum(valid_scores, axis=1, keepdims=True)
-            reusable_term = (cns_cum_scores / norm1) - (valid_scores / norm2)  # (n_cns x m+1)
+            reusable_term = (lc_cum_scores / norm1) - (valid_scores / norm2)  # (n_cns x m+1)
             reusable_term = tf.matmul(self.mtlr.ltri, reusable_term, transpose_b=True)  # (m x n_cns)
-            cns_part_feat_grad = tf.transpose(tf.matmul(self.mtlr.w, reusable_term))  # (n_cns x p)
-            cns_part_w_grad = tf.vectorized_map(
+            lc_part_feat_grad = tf.transpose(tf.matmul(self.mtlr.w, reusable_term))  # (n_cns x p)
+            lc_part_w_grad = tf.vectorized_map(
                 lambda a: tf.tensordot(a[0], a[1], axes=0),  # Outer product -> (n_cns x p x m)
-                [cns_input, tf.transpose(reusable_term)]  # (n_cns x p), (n_cns x m)
+                [lc_input, tf.transpose(reusable_term)]  # (n_cns x p), (n_cns x m)
             )  # (n_cns x p x m)
-            cns_part_b_grad = tf.transpose(reusable_term)  # (n_cns x m)
-            # endregion Censored partial gradients
+            lc_part_b_grad = tf.transpose(reusable_term)  # (n_cns x m)
+            # endregion Left-censored partial gradients
+
+            # region Right-censored partial gradients
+            valid_scores = tf.multiply(rc_cum_scores, rc_seq)
+            # Since rc_cum_scores was calculated using the shift, we need to use a log_norm term that is calculated
+            # from shifted scores to get norm1. This is achieved by taking the unshifted log_norm and subtracting the
+            # shift value.
+            norm1 = tf.exp(rc_log_norm - rc_shift)  # Normalization of all survival sequences
+            norm2 = tf.reduce_sum(valid_scores, axis=1, keepdims=True)
+            reusable_term = (rc_cum_scores / norm1) - (valid_scores / norm2)  # (n_cns x m+1)
+            reusable_term = tf.matmul(self.mtlr.ltri, reusable_term, transpose_b=True)  # (m x n_cns)
+            rc_part_feat_grad = tf.transpose(tf.matmul(self.mtlr.w, reusable_term))  # (n_cns x p)
+            rc_part_w_grad = tf.vectorized_map(
+                lambda a: tf.tensordot(a[0], a[1], axes=0),  # Outer product -> (n_cns x p x m)
+                [rc_input, tf.transpose(reusable_term)]  # (n_cns x p), (n_cns x m)
+            )  # (n_cns x p x m)
+            rc_part_b_grad = tf.transpose(reusable_term)  # (n_cns x m)
+            # endregion Right-censored partial gradients
 
             # region Uncensored partial gradients
-            seq_trunc = uncns_seq[:, :-1]  # Drop the final interval's bit from the survival sequence
-            norm = tf.exp(uncns_log_norm - uncns_shift)  # Normalization of all survival sequences
-            reusable_term = tf.matmul(uncns_cum_scores, self.mtlr.ltri, transpose_b=True) / norm
+            seq_trunc = uc_seq[:, :-1]  # Drop the final interval's bit from the survival sequence
+            norm = tf.exp(uc_log_norm - uc_shift)  # Normalization of all survival sequences
+            reusable_term = tf.matmul(uc_cum_scores, self.mtlr.ltri, transpose_b=True) / norm
             reusable_term = reusable_term - seq_trunc  # (n_uncns x m)
-            uncns_part_feat_grad = tf.transpose(tf.matmul(self.mtlr.w, reusable_term, transpose_b=True))
-            uncns_part_w_grad = tf.vectorized_map(
+            uc_part_feat_grad = tf.transpose(tf.matmul(self.mtlr.w, reusable_term, transpose_b=True))
+            uc_part_w_grad = tf.vectorized_map(
                 lambda a: tf.tensordot(a[0], a[1], axes=0),  # Outer product -> (n_uncns x p x m)
-                [uncns_input, reusable_term]  # (n_uncns x p), (n_uncns x m)
+                [uc_input, reusable_term]  # (n_uncns x p), (n_uncns x m)
             )  # (n_uncns x p x m)
-            uncns_part_b_grad = reusable_term  # (n_uncns x m)
+            uc_part_b_grad = reusable_term  # (n_uncns x m)
             # endregion Uncensored partial gradients
 
-            partial_feat_grad = tf.dynamic_stitch(condition_indices, [cns_part_feat_grad, uncns_part_feat_grad])
-            partial_w_grad = tf.dynamic_stitch(condition_indices, [cns_part_w_grad, uncns_part_w_grad])
-            partial_b_grad = tf.dynamic_stitch(condition_indices, [cns_part_b_grad, uncns_part_b_grad])
+            partial_feat_grad = tf.dynamic_stitch(condition_indices,
+                                                  [rc_part_feat_grad, uc_part_feat_grad, lc_part_feat_grad])
+            partial_w_grad = tf.dynamic_stitch(condition_indices,
+                                               [rc_part_w_grad, uc_part_w_grad, lc_part_w_grad])
+            partial_b_grad = tf.dynamic_stitch(condition_indices,
+                                               [rc_part_b_grad, uc_part_b_grad, lc_part_b_grad])
 
             features_grad = grad * partial_feat_grad / tf.cast(n_obs, tf.float32)
             time_grad = None

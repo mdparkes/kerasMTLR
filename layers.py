@@ -175,42 +175,62 @@ class MTLR(tf.keras.layers.Layer):
                                  trainable=True)
 
     @tf.function
-    def surv_seq(self, time: Tensor) -> Tensor:
+    def surv_seq(self, time: Tensor, censor: Tensor) -> Tensor:
         """
-        Creates a binary vector that indicates the time intervals by which an event occurred (if uncensored) or could
-        have occurred (if censored). For right-censored data, the intervals are [t[0]=0, t[1]), ..., [t[j-1], t[j]),
-        ..., [t[J], t[J+1]=Inf). The jth component of the vector has a value of 1 if the event occurred or could have
-        occurred in the interval [t[j-1], t[j]), and all intervals thereafter also have a value of 1; otherwise,
-        the value is 0.
+        Creates a binary vector that indicates the time intervals by which an event occurred (if uncensored) or the
+        intervals where death could have occurred (if censored). For censored data, the intervals are
+        [t[0]=0, t[1]), ..., [t[j-1], t[j]), ..., [t[J], t[J+1]=Inf). The jth component of the binary vector has a
+        value of 1 if the event occurred or could have occurred in the interval [t[j], t[j+1]). Otherwise, the value is
+        0. In the uncensored case, if the patient died in jth interval, all components from j through J are 1,
+        and all components from 0 through j-1 are 0.
 
         :param time: The observed time of event or censoring
-        :return: A binary sequence indicating intervals by which the event had occurred or may have occurred
+        :param censor: Indicates whether time is left-censored (-1), right-censored (0), or uncensored (1)
+        :return: A binary sequence indicating intervals by which the event had occurred (uncensored) or where it may
+        have occurred (censored)
         """
-        time = tf.case(
-            [(tf.equal(tf.rank(time), 0),  # If time is a scalar Tensor...
-              lambda: tf.reshape(time, shape=(-1, )))],  # ...make it a vector...
-            default=lambda: time  # ...otherwise leave it as-is
-        )
-        sequence = tf.map_fn(lambda t: tf.where(t < self.interval_upper,
-                                                tf.ones_like(self.interval_upper),
-                                                tf.zeros_like(self.interval_upper)), time)
-        sequence = tf.case(
-            [(tf.equal(tf.rank(sequence), 1),  # If sequence is a vector...
-              lambda: tf.reshape(sequence, (-1, tf.shape(sequence)[0])))],  # ...make it a matrix...
-            default=lambda: sequence,  # (n_obs x n_intervals) ... otherwise leave it as-is
-            name="surv_seq"
-        )
+
+        def tensor_as_vector(tensor):
+            """If `tensor` is a scalar, make it a vector. If it is already a vector, leave it as-is."""
+            vector = tf.case(
+                [(tf.equal(tf.rank(tensor), 0),
+                  lambda: tf.reshape(tensor, shape=(-1,)))],
+                default=lambda: tensor
+            )
+            return vector
+
+        time = tensor_as_vector(time)
+        # Dynamic partitioning can only use non-negative integers, so left-censoring values of -1 are substituted with 2
+        censor = tf.where(censor == -1, tf.fill(tf.shape(censor), 2), censor)
+        obs_idx = tf.range(tf.shape(time)[0])  # Indices of each time in the data set
+        condition_indices = tf.dynamic_partition(obs_idx, censor, 3)  # For restitching
+        # rc: right censored (censor = 0); uc: uncensored (censor = 1); lc: left censored (censor = 2)
+        rc_time, uc_time, lc_time = tf.dynamic_partition(time, censor, 3)  # List of partitions
+        rc_seq = tf.map_fn(lambda t: tf.where(t < self.interval_upper,
+                                              tf.ones_like(self.interval_upper),
+                                              tf.zeros_like(self.interval_upper)), rc_time)
+        uc_seq = tf.map_fn(lambda t: tf.where(t < self.interval_upper,
+                                              tf.ones_like(self.interval_upper),
+                                              tf.zeros_like(self.interval_upper)), uc_time)
+        lc_seq = tf.map_fn(lambda t: tf.where(t >= self.interval_upper,
+                                              tf.ones_like(self.interval_upper),
+                                              tf.zeros_like(self.interval_upper)), lc_time)
+        sequence = tf.dynamic_stitch(condition_indices, data=[rc_seq, uc_seq, lc_seq])
 
         return sequence
 
     @tf.function
     def survival_fn(self, features: Tensor, time: Tensor) -> Tensor:
         """Calculates the probability of observing the survival sequence(s) implied by death at the specified time"""
-        surv_seq = tf.cast(self.surv_seq(time), tf.float32)  # (n_obs x n_intervals) = (n_obs x m+1)
-        # Unnormalized score of death occurring in each interval
+        # Below we specify the `event` tensor as a tensor full of ones for use with `self.surv_seq`. This will generate
+        # the survival sequence for the case where the patient dies at the interval that `time` falls into.
+        event = tf.ones_like(time)
+        surv_seq = tf.cast(self.surv_seq(time, event), tf.float32)  # (n_obs x n_intervals) = (n_obs x m+1)
+        # Unnormalized score for each bit that represents a single interval in a survival sequence
         scores = tf.matmul(features, self.w) + self.b  # (n_obs x n_times) = (n_obs x m)
-        # Unnormalized score of surviving at least until the beginning of each interval; equivalently,
-        # the probability that death occurred during or after each interval (marginalize over all applicable outcomes)
+        # For all monotonically increasing survival sequences, calculate the total unnormalized score for the
+        # non-zero bits. This gives the unnormalized scores associated with observing all the different survival
+        # sequences. These are needed to calculate the normalization factor.
         cumulative_scores = tf.matmul(scores, self.ltri)  # (n_obs x n_intervals)
         # Shifting the values by a constant safeguards against stack overflow during exponentiation
         shift = tf.maximum(tf.reduce_max(cumulative_scores, axis=1, keepdims=True), 0)  # (n_obs x 1)
@@ -221,7 +241,9 @@ class MTLR(tf.keras.layers.Layer):
         # in the final interval (which is not explicitly modeled by the model parameters), is defined as zero,
         # so zero is appended to the end of the score vector
         scores = tf.concat([scores, tf.zeros(shape=(tf.shape(scores)[0], 1), dtype=tf.float32)], axis=1)
+        # Exclude scores for survival sequences that are not compatible with the time of death
         log_score = tf.reduce_sum(tf.multiply(scores, surv_seq), axis=1, keepdims=True)
+        # Calculate the probability of observing death in the interval that includes the specified time
         surv_prob = tf.exp(log_score - log_normalization, name="surv_prob")  # (n_obs x 1)
 
         return surv_prob
