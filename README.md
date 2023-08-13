@@ -19,6 +19,8 @@ The trainable parameters of the MTLR layer maximize the likelihood of the observ
 
 The `MTLR` `Layer`'s forward pass returns an array of probabilities that a patient's time of death was greater than or equal to the lower bound of each of the intervals that were used to partition time. The probability of an event occurring in any particular interval can be calculated by a forward pass of the `NeuralNetworkMTLRSurvival.mtlr` `Layer`.
 
+Event data (i.e. whether the event was observed, left-censored, or right-censored) should be input as -1 for left-censored, 0 for right-censored, and 1 for uncensored.
+
 ## Usage Example
 ```
 import numpy as np
