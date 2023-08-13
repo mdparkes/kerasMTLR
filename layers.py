@@ -201,7 +201,7 @@ class MTLR(tf.keras.layers.Layer):
 
         time = tensor_as_vector(time)
         # Dynamic partitioning can only use non-negative integers, so left-censoring values of -1 are substituted with 2
-        censor = tf.where(censor == -1, tf.fill(tf.shape(censor), 2), censor)
+        censor = tf.where(censor == -1, tf.fill(tf.shape(censor), 2), tf.cast(censor, tf.int32))
         obs_idx = tf.range(tf.shape(time)[0])  # Indices of each time in the data set
         condition_indices = tf.dynamic_partition(obs_idx, censor, 3)  # For restitching
         # rc: right censored (censor = 0); uc: uncensored (censor = 1); lc: left censored (censor = 2)
@@ -249,7 +249,7 @@ class MTLR(tf.keras.layers.Layer):
         return surv_prob
 
     def call(self, inputs, *args, **kwargs):
-        """Forward pass calculates the probability of observing death in each interval"""
+        """Forward pass calculates the probability of observing death in each interval given some input features"""
         survival_distribution = tf.vectorized_map(
             lambda t: self.survival_fn(inputs, tf.repeat(t, tf.shape(inputs)[0])),
             self.interval_lower
